@@ -1,68 +1,47 @@
 import random
 import streamlit as st
 
-def get_range_for_difficulty(difficulty: str):
-    if difficulty == "Easy":
-        return 1, 20
-    if difficulty == "Normal":
-        return 1, 100
-    if difficulty == "Hard":
-        return 1, 50
-    return 1, 100
+# FIX: Refactored game logic out of app.py into logic_utils.py using AI
+# assistance; app.py now only handles the Streamlit UI.
+from logic_utils import (
+    TEMPERATURE_LABELS,
+    check_guess,
+    get_range_for_difficulty,
+    get_temperature,
+    parse_guess,
+    update_high_score,
+    update_score,
+)
 
 
-def parse_guess(raw: str):
-    if raw is None:
-        return False, None, "Enter a guess."
-
-    if raw == "":
-        return False, None, "Enter a guess."
-
-    try:
-        if "." in raw:
-            value = int(float(raw))
-        else:
-            value = int(raw)
-    except Exception:
-        return False, None, "That is not a number."
-
-    return True, value, None
+def show_hint_message(message, temperature):
+    """Show a color-coded hint: red = hot, yellow = warm, blue = cold."""
+    text = f"{message}  {TEMPERATURE_LABELS[temperature]}"
+    if temperature == "Exact":
+        st.success(text)
+    elif temperature == "Hot":
+        st.error(text)
+    elif temperature == "Warm":
+        st.warning(text)
+    else:
+        st.info(text)
 
 
-def check_guess(guess, secret):
-    if guess == secret:
-        return "Win", "🎉 Correct!"
+def render_summary():
+    """Show the session high score and a table of every valid guess."""
+    st.subheader("📊 Session summary")
+    col_high, col_score = st.columns(2)
+    with col_high:
+        high = st.session_state.high_score
+        st.metric("🏆 High score", "—" if high is None else high)
+    with col_score:
+        st.metric("Current score", st.session_state.score)
 
-    try:
-        if guess > secret:
-            return "Too High", "📈 Go HIGHER!"
-        else:
-            return "Too Low", "📉 Go LOWER!"
-    except TypeError:
-        g = str(guess)
-        if g == secret:
-            return "Win", "🎉 Correct!"
-        if g > secret:
-            return "Too High", "📈 Go HIGHER!"
-        return "Too Low", "📉 Go LOWER!"
+    if st.session_state.guess_log:
+        st.table(st.session_state.guess_log)
+    else:
+        st.caption("No guesses yet. Make one above!")
 
-
-def update_score(current_score: int, outcome: str, attempt_number: int):
-    if outcome == "Win":
-        points = 100 - 10 * (attempt_number + 1)
-        if points < 10:
-            points = 10
-        return current_score + points
-
-    if outcome == "Too High":
-        if attempt_number % 2 == 0:
-            return current_score + 5
-        return current_score - 5
-
-    if outcome == "Too Low":
-        return current_score - 5
-
-    return current_score
 
 st.set_page_config(page_title="Glitchy Guesser", page_icon="🎮")
 
@@ -92,8 +71,9 @@ st.sidebar.caption(f"Attempts allowed: {attempt_limit}")
 if "secret" not in st.session_state:
     st.session_state.secret = random.randint(low, high)
 
+# FIX: attempts used to start at 1, so "Attempts left" was off by one.
 if "attempts" not in st.session_state:
-    st.session_state.attempts = 1
+    st.session_state.attempts = 0
 
 if "score" not in st.session_state:
     st.session_state.score = 0
@@ -104,10 +84,21 @@ if "status" not in st.session_state:
 if "history" not in st.session_state:
     st.session_state.history = []
 
+# FEATURE: High score tracker. It is NOT reset by New Game, so it keeps
+# the best winning score for the whole browser session. Added with AI
+# assistance.
+if "high_score" not in st.session_state:
+    st.session_state.high_score = None
+
+# FEATURE: One row per valid guess, shown in the session summary table.
+if "guess_log" not in st.session_state:
+    st.session_state.guess_log = []
+
 st.subheader("Make a guess")
 
+# FIX: The prompt was hard-coded to "1 and 100"; it now uses the real range.
 st.info(
-    f"Guess a number between 1 and 100. "
+    f"Guess a number between {low} and {high}. "
     f"Attempts left: {attempt_limit - st.session_state.attempts}"
 )
 
@@ -132,8 +123,16 @@ with col3:
     show_hint = st.checkbox("Show hint", value=True)
 
 if new_game:
+    # FIX: New Game now resets everything (status, score, history) and uses
+    # the selected difficulty's range instead of always 1-100. Before, a won
+    # or lost game stayed locked after clicking New Game.
+    # The high score is kept on purpose.
     st.session_state.attempts = 0
-    st.session_state.secret = random.randint(1, 100)
+    st.session_state.secret = random.randint(low, high)
+    st.session_state.score = 0
+    st.session_state.status = "playing"
+    st.session_state.history = []
+    st.session_state.guess_log = []
     st.success("New game started.")
     st.rerun()
 
@@ -142,6 +141,7 @@ if st.session_state.status != "playing":
         st.success("You already won. Start a new game to play again.")
     else:
         st.error("Game over. Start a new game to try again.")
+    render_summary()
     st.stop()
 
 if submit:
@@ -155,15 +155,25 @@ if submit:
     else:
         st.session_state.history.append(guess_int)
 
-        if st.session_state.attempts % 2 == 0:
-            secret = str(st.session_state.secret)
-        else:
-            secret = st.session_state.secret
+        # FIX: Removed the code that converted the secret to a string on even
+        # attempts. That made comparisons lexicographic ("9" > "50") and
+        # produced wrong hints on every other guess.
+        secret = st.session_state.secret
 
         outcome, message = check_guess(guess_int, secret)
+        temperature = get_temperature(guess_int, secret, low, high)
 
         if show_hint:
-            st.warning(message)
+            show_hint_message(message, temperature)
+
+        st.session_state.guess_log.append(
+            {
+                "Attempt": st.session_state.attempts,
+                "Guess": guess_int,
+                "Result": outcome,
+                "Closeness": TEMPERATURE_LABELS[temperature],
+            }
+        )
 
         st.session_state.score = update_score(
             current_score=st.session_state.score,
@@ -174,6 +184,9 @@ if submit:
         if outcome == "Win":
             st.balloons()
             st.session_state.status = "won"
+            st.session_state.high_score = update_high_score(
+                st.session_state.high_score, st.session_state.score
+            )
             st.success(
                 f"You won! The secret was {st.session_state.secret}. "
                 f"Final score: {st.session_state.score}"
@@ -186,6 +199,8 @@ if submit:
                     f"The secret was {st.session_state.secret}. "
                     f"Score: {st.session_state.score}"
                 )
+
+render_summary()
 
 st.divider()
 st.caption("Built by an AI that claims this code is production-ready.")
